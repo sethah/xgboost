@@ -30,27 +30,38 @@ import org.apache.spark.sql.Dataset
 import org.apache.spark.ml.feature.{LabeledPoint => MLLabeledPoint}
 import org.apache.spark.{SparkContext, SparkParallelismTracker, TaskContext}
 
+
+/**
+ * Rabit tracker configurations.
+ *
+ * @param workerConnectionTimeout The timeout for all workers to connect to the tracker.
+ *                                Set timeout length to zero to disable timeout.
+ *                                Use a finite, non-zero timeout value to prevent tracker from
+ *                                hanging indefinitely (in milliseconds)
+ *                                (supported by "scala" implementation only.)
+ * @param trackerImpl Choice between "python" or "scala". The former utilizes the Java wrapper of
+ *                    the Python Rabit tracker (in dmlc_core), whereas the latter is implemented
+ *                    in Scala without Python components, and with full support of timeouts.
+ *                    The Scala implementation is currently experimental, use at your own risk.
+ */
+case class TrackerConf(workerConnectionTimeout: Long, trackerImpl: String)
+
 object TrackerConf {
   def apply(): TrackerConf = TrackerConf(0L, "python")
 }
 
-/**
-  * Rabit tracker configurations.
-  * @param workerConnectionTimeout The timeout for all workers to connect to the tracker.
-  *                                Set timeout length to zero to disable timeout.
-  *                                Use a finite, non-zero timeout value to prevent tracker from
-  *                                hanging indefinitely (in milliseconds)
- *                                (supported by "scala" implementation only.)
-  * @param trackerImpl Choice between "python" or "scala". The former utilizes the Java wrapper of
-  *                    the Python Rabit tracker (in dmlc_core), whereas the latter is implemented
-  *                    in Scala without Python components, and with full support of timeouts.
-  *                    The Scala implementation is currently experimental, use at your own risk.
-  */
-case class TrackerConf(workerConnectionTimeout: Long, trackerImpl: String)
-
 object XGBoost extends Serializable {
   private val logger = LogFactory.getLog("XGBoostSpark")
 
+  /**
+   * Remove explicit missing values from each point in an iterator of
+   * [[ml.dmlc.xgboost4j.LabeledPoint]]. If `missing` is specified as `Float.NaN`, then the
+   * returned iterator is unchanged.
+   *
+   * @param denseLabeledPoints The input iterator.
+   * @param missing The Float value to use to designate a missing value.
+   * @return Iterator with missing values removed.
+   */
   private def fromDenseToSparseLabeledPoints(
       denseLabeledPoints: Iterator[XGBLabeledPoint],
       missing: Float): Iterator[XGBLabeledPoint] = {
@@ -69,6 +80,16 @@ object XGBoost extends Serializable {
     }
   }
 
+  /**
+   * Check whether the base margins for each point have been defined or not.
+   * Returns:
+   *   -`None` if no margins are specified
+   *   -`Some(baseMargins)` if all margins have been specified
+   *   -throws `IllegalArgumentException` otherwise
+   *
+   * @param baseMargins Iterator of raw base margin values.
+   * @return Option containing specified base margins.
+   */
   private def fromBaseMarginsToArray(baseMargins: Iterator[Float]): Option[Array[Float]] = {
     val builder = new mutable.ArrayBuilder.ofFloat()
     var nTotal = 0
@@ -93,6 +114,24 @@ object XGBoost extends Serializable {
     }
   }
 
+  /**
+   * Create an RDD which is responsible for actually executing the training stage. Each RDD
+   * partition is converted to an XGBoost `DMatrix`, and a gradient boosted decision tree model
+   * is trained by calling into the native XGBoost code through the Java Native Interface.
+   *
+   * @param data the training set represented as an RDD
+   * @param params Hashmap containing the configuration entries
+   * @param rabitEnv Hashmap containing configuration parameters for the all-reduce environment
+   * @param numWorkers the number of xgboost workers, 0 by default which means that the number of
+   *                   workers equals to the partition number of trainingData RDD
+   * @param round the number of boosting iterations
+   * @param obj An instance of [[ObjectiveTrait]] specifying a custom objective function
+   * @param eval An instance of [[EvalTrait]] specifying a custom evaluation function
+   * @param useExternalMemory indicate whether to use external memory cache, by setting this flag as
+   *                          true, the user may save the RAM cost for running XGBoost within Spark
+   * @param missing A Float value that designates a missing value in the training data.
+   * @return Distributed collection of boosting models represented as an RDD
+   */
   private[spark] def buildDistributedBoosters(
       data: RDD[XGBLabeledPoint],
       params: Map[String, Any],
@@ -147,8 +186,9 @@ object XGBoost extends Serializable {
   }
 
   /**
-   * train XGBoost model with the DataFrame-represented data
-   * @param trainingData the trainingset represented as DataFrame
+   * Train XGBoost model with the DataFrame-represented data
+   *
+   * @param trainingData the training set represented as DataFrame
    * @param params Map containing the parameters to configure XGBoost
    * @param round the number of iterations
    * @param nWorkers the number of xgboost workers, 0 by default which means that the number of
@@ -157,7 +197,7 @@ object XGBoost extends Serializable {
    * @param eval the user-defined evaluation function, null by default
    * @param useExternalMemory indicate whether to use external memory cache, by setting this flag as
    *                           true, the user may save the RAM cost for running XGBoost within Spark
-   * @param missing the value represented the missing value in the dataset
+   * @param missing A Float value which represents a missing value in the dataset
    * @param featureCol the name of input column, "features" as default value
    * @param labelCol the name of output column, "label" as default value
    * @throws ml.dmlc.xgboost4j.java.XGBoostError when the model training is failed
@@ -200,8 +240,9 @@ object XGBoost extends Serializable {
   }
 
   /**
-   * train XGBoost model with the RDD-represented data
-   * @param trainingData the trainingset represented as RDD
+   * Train XGBoost model with the RDD-represented data
+   *
+   * @param trainingData the training set represented as RDD
    * @param params Map containing the configuration entries
    * @param round the number of iterations
    * @param nWorkers the number of xgboost workers, 0 by default which means that the number of
@@ -256,8 +297,9 @@ object XGBoost extends Serializable {
   }
 
   /**
-   * various of train()
-   * @param trainingData the trainingset represented as RDD
+   * Trains XGBoost model on a Spark RDD of [[org.apache.spark.ml.feature.LabeledPoint]].
+   *
+   * @param trainingData the training set represented as RDD
    * @param params Map containing the configuration entries
    * @param round the number of iterations
    * @param nWorkers the number of xgboost workers, 0 by default which means that the number of
@@ -288,6 +330,27 @@ object XGBoost extends Serializable {
       useExternalMemory, missing)
   }
 
+  /**
+   * This method trains an XGBoost model on a distributed collection of labeled training points.
+   * In each partition of the training RDD a booster is trained on the subset of data in that
+   * partition. The model is then updated globally using an all-reduce communication model across
+   * Spark workers.
+   *
+   * A [[RabitTracker]] is created to monitor the status of the all-reduce worker nodes and to
+   * verify that training completes successfully.
+   *
+   * @param trainingData RDD containing labeled training points.
+   * @param params Hashmap of training configuration parameters.
+   * @param round The number of boosting rounds to execute.
+   * @param nWorkers The number of training workers to run in parallel (Spark partitions).
+   * @param obj An instance of [[ObjectiveTrait]] specifying a custom objective implemented in
+   *            Scala or Java.
+   * @param eval An instance of [[EvalTrait]] specifying a custom evaluation metric
+   * @param useExternalMemory Whether to enable XGBoost to store some data on disk when not enough
+   *                          memory is available to load the entire dataset.
+   * @param missing A Float value which designates a missing value in the training data.
+   * @return
+   */
   @throws(classOf[XGBoostError])
   private[spark] def trainDistributed(
       trainingData: RDD[XGBLabeledPoint],
@@ -339,8 +402,7 @@ object XGBoost extends Serializable {
       val isClsTask = isClassificationTask(params)
       val trackerReturnVal = parallelismTracker.execute(tracker.waitFor(0L))
       logger.info(s"Rabit returns with exit code $trackerReturnVal")
-      val model = postTrackerReturnProcessing(trackerReturnVal, boosters, overriddenParams,
-        sparkJobThread, isClsTask)
+      val model = postTrackerReturnProcessing(trackerReturnVal, boosters, sparkJobThread, isClsTask)
       if (isClsTask){
         model.asInstanceOf[XGBoostClassificationModel].numOfClasses =
           params.getOrElse("num_class", "2").toString.toInt
@@ -351,10 +413,24 @@ object XGBoost extends Serializable {
     }
   }
 
+  /**
+   * Check if the Rabit tracker returned successfully and create a model from the boosters. If
+   * tracker exited unsuccessfully, clean up and throw an error to indicate training failed.
+   *
+   * @note Copies of the finished model reside in each partition of the `distributedBoosters`.
+   *       Any of them can be used to create the model. Here, just choose the first partition.
+   *
+   * @param trackerReturnVal Exit code of the Rabit tracker.
+   * @param distributedBoosters RDD of boosters trained on each partition.
+   * @param sparkJobThread Background thread which executes training.
+   * @param isClassificationTask Boolean indicating if model is trained for classification.
+   * @return Trained [[XGBoostModel]].
+   */
   private def postTrackerReturnProcessing(
-      trackerReturnVal: Int, distributedBoosters: RDD[Booster],
-      params: Map[String, Any], sparkJobThread: Thread, isClassificationTask: Boolean):
-    XGBoostModel = {
+      trackerReturnVal: Int,
+      distributedBoosters: RDD[Booster],
+      sparkJobThread: Thread,
+      isClassificationTask: Boolean): XGBoostModel = {
     if (trackerReturnVal == 0) {
       val xgboostModel = XGBoostModel(distributedBoosters.first(), isClassificationTask)
       distributedBoosters.unpersist(false)
@@ -365,7 +441,7 @@ object XGBoost extends Serializable {
           sparkJobThread.interrupt()
         }
       } catch {
-        case ie: InterruptedException =>
+        case _: InterruptedException =>
           logger.info("spark job thread is interrupted")
       }
       throw new XGBoostError("XGBoostModel training failed")
@@ -380,8 +456,10 @@ object XGBoost extends Serializable {
   }
 
   private def setGeneralModelParams(
-      featureCol: String, labelCol: String, predCol: String, xgBoostModel: XGBoostModel):
-      XGBoostModel = {
+      featureCol: String,
+      labelCol: String,
+      predCol: String,
+      xgBoostModel: XGBoostModel): XGBoostModel = {
     xgBoostModel.setFeaturesCol(featureCol)
     xgBoostModel.setLabelCol(labelCol)
     xgBoostModel.setPredictionCol(predCol)
@@ -414,6 +492,7 @@ object XGBoost extends Serializable {
         val xgBoostModel = new XGBoostClassificationModel(SXGBoost.loadModel(dataInStream))
         setGeneralModelParams(featureCol, labelCol, predictionCol, xgBoostModel).
           asInstanceOf[XGBoostClassificationModel].setRawPredictionCol(rawPredictionCol)
+        xgBoostModel.set()
         if (thresholdLength != -1) {
           xgBoostModel.setThresholds(thresholds)
         }
@@ -422,24 +501,37 @@ object XGBoost extends Serializable {
       case "_reg_" =>
         val xgBoostModel = new XGBoostRegressionModel(SXGBoost.loadModel(dataInStream))
         setGeneralModelParams(featureCol, labelCol, predictionCol, xgBoostModel)
+      case other =>
+        throw new XGBoostError(s"Unknown model type $other. Supported types are: [_reg_, _cls_].")
     }
   }
 }
 
+/** Class to hold the training and test matrices in a given partition. */
 private class Watches private(val train: DMatrix, val test: DMatrix) {
-  def toMap: Map[String, DMatrix] = Map("train" -> train, "test" -> test)
-      .filter { case (_, matrix) => matrix.rowNum > 0 }
+
+  def toMap: Map[String, DMatrix] = {
+    Map("train" -> train, "test" -> test).filter { case (_, matrix) => matrix.rowNum > 0 }
+  }
 
   def size: Int = toMap.size
 
-  def delete(): Unit = {
-    toMap.values.foreach(_.delete())
-  }
+  def delete(): Unit = toMap.values.foreach(_.delete())
 
   override def toString: String = toMap.toString
 }
 
 private object Watches {
+
+  /**
+   * Build train and test `DMatrix` from the Spark partition iterator.
+   *
+   * @param params Parameter map.
+   * @param labeledPoints Iterator of [[XGBLabeledPoint]].
+   * @param baseMarginsOpt Option containing base margins for each labeled point.
+   * @param cacheFileName Prefix for data cache files.
+   * @return Watches instance, holding train and test matrices.
+   */
   def apply(
       params: Map[String, Any],
       labeledPoints: Iterator[XGBLabeledPoint],
